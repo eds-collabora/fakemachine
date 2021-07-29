@@ -335,6 +335,11 @@ func (m *Machine) CreateImage(imagepath string, size int64) (string, error) {
 	return m.CreateImageWithLabel(imagepath, size, label)
 }
 
+// GetBackend returns the actually selected backend (never auto)
+func (m *Machine) GetBackend() (backend) {
+	return m.backend
+}
+
 // SetMemory sets the fakemachines amount of memory (in megabytes). Defaults to
 // 2048 MB
 func (m *Machine) SetMemory(memory int) {

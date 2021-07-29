@@ -432,16 +432,22 @@ func (m *Machine) writerKernelModules(w *writerhelper.WriterHelper, moddir strin
 		}
 
 		modpath := path.Join(moddir, v)
+		basepath := modpath
 
 		if strings.HasSuffix(modpath, ".ko") {
-			if _, err := os.Stat(modpath); err != nil {
-				modpath += ".xz"
+			suffixes := []string { "", ".gz", ".xz", ".zst" }
+			found := false
+			for _, suffix := range suffixes {
+				modpath = basepath + suffix
+				if _, err := os.Stat(modpath); err == nil {
+					found = true
+					break
+				}
 			}
-			if _, err := os.Stat(modpath); err != nil {
-				return err
+			if !found {
+				return fmt.Errorf("Unable to find required module %s", modpath)
 			}
 		}
-
 		if err := w.CopyFile(modpath); err != nil {
 			return err
 		}
@@ -585,7 +591,10 @@ func (m *Machine) startup(command string, extracontent [][2]string) (int, error)
 		"/etc/resolv.conf",
 		0755)
 
-	m.writerKernelModules(w, kernelModuleDir, backend.InitrdModules())
+	err = m.writerKernelModules(w, kernelModuleDir, backend.InitrdModules())
+	if err != nil {
+		return -1, err
+	}
 
 	w.WriteFile("etc/systemd/system/fakemachine.service",
 		fmt.Sprintf(serviceTemplate, backend.JobOutputTTY(), strings.Join(m.Environ, " ")), 0644)

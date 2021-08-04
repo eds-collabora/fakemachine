@@ -110,6 +110,14 @@ func NewMachineWithBackend(backendName string) (*Machine, error) {
 		m.AddVolume("/etc/ssl")
 	}
 
+	// Security configuration for Fedora and similar
+	if _, err := os.Stat("/etc/pki/tls/certs"); err == nil {
+		m.AddVolume("/etc/pki/tls/certs")
+	}
+	if _, err := os.Stat("/etc/crypto-policies"); err == nil {
+		m.AddVolume("/etc/crypto-policies")
+	}
+
 	// Dbus configuration
 	if _, err := os.Stat("/etc/dbus-1"); err == nil {
 		m.AddVolume("/etc/dbus-1")
@@ -713,6 +721,9 @@ func (m *Machine) startup(command string, extracontent [][2]string) (int, error)
 	udevRules := strings.Join(backend.UdevRules(), "\n") + "\n"
 	w.WriteFile("/etc/udev/rules.d/61-fakemachine.rules", udevRules, 0444)
 
+	// Systemd configuration data (required if key services are
+	// enabled in /etc, as in Fedora)
+	w.CopyTreeWithFilter("/etc/systemd", writerhelper.Exclude("/etc/systemd/network"))
 	w.WriteFile("/etc/systemd/network/ethernet.network",
 		fmt.Sprintf(networkdTemplate, backend.NetworkdMatch()), 0444)
 	w.WriteSymlink(

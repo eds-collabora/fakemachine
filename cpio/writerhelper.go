@@ -18,6 +18,7 @@ type WriterHelper struct {
 }
 
 type Transformer func(dst io.Writer, src io.Reader) error
+type Filter func(target string) bool
 
 func NewWriterHelper(f io.Writer) *WriterHelper {
 	return &WriterHelper{
@@ -107,20 +108,43 @@ func (w *WriterHelper) WriteCharDevice(device string, major, minor int64,
 	w.WriteHeader(hdr)
 }
 
-func (w *WriterHelper) CopyTree(path string) {
+func All(path string) bool {
+	return true
+}
+
+func Exclude(path string) Filter {
+	return func(p string) bool {
+		return p != path
+	}
+}
+
+func (w *WriterHelper) CopyTreeWithFilter(path string, filter Filter) {
 	walker := func(p string, info os.FileInfo, err error) error {
-		if info.Mode().IsDir() {
-			w.WriteDirectory(p, info.Mode() & ^os.ModeType)
-		} else if info.Mode().IsRegular() {
-			w.CopyFile(p)
+		if !filter(p) {
+			if info.Mode().IsDir() {
+				return filepath.SkipDir
+			}
 		} else {
-			panic("No handled")
+			if info.Mode().IsDir() {
+				w.WriteDirectory(p, info.Mode() & ^os.ModeType)
+			} else if info.Mode().IsRegular() {
+				w.CopyFile(p)
+			} else if info.Mode().Type() == os.ModeSymlink {
+				target, _ := os.Readlink(p)
+				w.WriteSymlink(target, p, info.Mode() & ^os.ModeType)
+			} else {
+				panic("No handled")
+			}
 		}
 
 		return nil
 	}
 
 	filepath.Walk(path, walker)
+}
+
+func (w *WriterHelper) CopyTree(path string) {
+	w.CopyTreeWithFilter(path, All)
 }
 
 func (w *WriterHelper) CopyFileTo(src, dst string) error {

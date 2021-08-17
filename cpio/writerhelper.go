@@ -129,7 +129,7 @@ func (w *WriterHelper) CopyTreeWithFilter(path string, filter Filter) {
 				w.WriteDirectory(p, info.Mode() & ^os.ModeType)
 			} else if info.Mode().IsRegular() {
 				w.CopyFile(p)
-			} else if info.Mode().Type() == os.ModeSymlink {
+			} else if info.Mode() & os.ModeType == os.ModeSymlink {
 				target, _ := os.Readlink(p)
 				w.WriteSymlink(target, p, info.Mode() & ^os.ModeType)
 			} else {

@@ -1,5 +1,5 @@
 // +build linux
-// +build amd64
+// +build 386 amd64 arm64 ppc64 ppc64le mips mipsle mips64 mips64le s390x
 
 package fakemachine
 
@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -18,6 +19,7 @@ import (
 
 type kvmBackend struct {
 	machine *Machine
+	arch string
 }
 
 func newKvmBackend(m *Machine) kvmBackend {
@@ -41,8 +43,48 @@ func (b kvmBackend) Supported() (bool, error) {
 	return true, nil
 }
 
+func (b kvmBackend) nativeQemu() (string, error) {
+	var qemu string
+	switch runtime.GOARCH {
+	case "386":
+		qemu = "qemu-system-i386"
+	case "amd64":
+		qemu = "qemu-system-x86_64"
+	case "arm":
+		// Assume Debian armhf ABI
+		qemu = "qemu-system-arm"
+	case "arm64":
+		qemu = "qemu-system-aarch64"
+	case "ppc64":
+		qemu = "qemu-system-ppc64"
+	case "ppc64le":
+		qemu = "qemu-system-ppc64le"
+	case "mips":
+		// Assume Debian mips ABI
+		qemu = "qemu-system-mips"
+	case "mipsle":
+		// Assume Debian mipsel ABI
+		qemu = "qemu-system-mipsel"
+	case "mips64":
+		// Assume Debian mips64 ABI
+		qemu = "qemu-system-mips64"
+	case "mips64le":
+		// Assume Debian mips64le ABI
+		qemu = "qemu-system-mips64el"
+	case "s390x":
+		qemu = "qemu-system-s390x"
+	default:
+		return "", fmt.Errorf("Unsupported CPU %s", runtime.GOARCH)
+	}
+	return qemu, nil
+}
+	
 func (b kvmBackend) QemuPath() (string, error) {
-	return exec.LookPath("qemu-system-x86_64")
+	qemu, err := b.nativeQemu()
+	if err != nil {
+		return "", err
+	}
+	return exec.LookPath(qemu)
 }
 
 func (b kvmBackend) hostKernelRelease() (string, error) {
@@ -209,7 +251,11 @@ func (b kvmBackend) Start() (bool, error) {
 	}
 	memory := fmt.Sprintf("%d", m.memory)
 	numcpus := fmt.Sprintf("%d", m.numcpus)
-	qemuargs := []string{"qemu-system-x86_64",
+	qemu, err := b.nativeQemu()
+	if err != nil {
+		return false, err
+	}
+	qemuargs := []string{qemu,
 		"-cpu", "host",
 		"-smp", numcpus,
 		"-m", memory,

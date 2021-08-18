@@ -1,5 +1,5 @@
 // +build linux
-// +build amd64
+// +build 386 amd64 arm64 ppc64 ppc64le mips mipsle mips64 mips64le s390x
 
 package fakemachine
 

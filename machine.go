@@ -4,16 +4,19 @@
 package fakemachine
 
 import (
+	"bufio"
+	"bytes"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
+	"text/template"
 
 	"github.com/go-debos/fakemachine/cpio"
 )
@@ -28,10 +31,25 @@ func mergedUsrSystem() bool {
 	return false
 }
 
+// Evaluate any symbolic link, then return the path's directory. Returns an
+// absolute path. Think of it as realpath(1) + dirname(1) in bash.
+func realDir(path string) (string, error) {
+	var p string
+	var err error
+	if p, err = filepath.Abs(path); err != nil {
+		return "", err
+	}
+	if p, err = filepath.EvalSymlinks(p); err != nil {
+		return "", err
+	}
+	return filepath.Dir(p), nil
+}
+
 type mountPoint struct {
 	hostDirectory    string
 	machineDirectory string
 	label            string
+	static           bool
 }
 
 type image struct {
@@ -40,21 +58,41 @@ type image struct {
 }
 
 type Machine struct {
-	mounts  []mountPoint
-	count   int
-	images  []image
-	memory  int
-	numcpus int
+	backend  backend
+	mounts   []mountPoint
+	count    int
+	images   []image
+	memory   int
+	numcpus  int
+	showBoot bool
+	Environ  []string
 
 	scratchsize int64
 	scratchpath string
 	scratchfile string
 	scratchdev  string
+	initrdpath  string
+}
+
+// Create a new machine object with the auto backend
+func NewMachine() *Machine {
+	m, err := NewMachineWithBackend("auto")
+	if err != nil {
+		panic(err)
+	}
+	return m
 }
 
 // Create a new machine object
-func NewMachine() (m *Machine) {
-	m = &Machine{memory: 2048, numcpus: runtime.NumCPU()}
+func NewMachineWithBackend(backendName string) (*Machine, error) {
+	var err error
+	m := &Machine{memory: 2048, numcpus: runtime.NumCPU()}
+
+	m.backend, err = newBackend(backendName, m)
+	if err != nil {
+		return nil, err
+	}
+
 	// usr is mounted by specific label via /init
 	m.addStaticVolume("/usr", "usr")
 
@@ -63,21 +101,30 @@ func NewMachine() (m *Machine) {
 		m.addStaticVolume("/bin", "bin")
 		m.addStaticVolume("/lib", "lib")
 	}
-	// Mount for ssl certificates
+
+	// Mounts for ssl certificates
+	if _, err := os.Stat("/etc/ca-certificates"); err == nil {
+		m.AddVolume("/etc/ca-certificates")
+	}
 	if _, err := os.Stat("/etc/ssl"); err == nil {
 		m.AddVolume("/etc/ssl")
 	}
 
 	// Dbus configuration
-	m.AddVolume("/etc/dbus-1")
-	// Alternative symlinks
-	m.AddVolume("/etc/alternatives")
+	if _, err := os.Stat("/etc/dbus-1"); err == nil {
+		m.AddVolume("/etc/dbus-1")
+	}
+
+	// Debian alternative symlinks
+	if _, err := os.Stat("/etc/alternatives"); err == nil {
+		m.AddVolume("/etc/alternatives")
+	}
 	// Debians binfmt registry
 	if _, err := os.Stat("/var/lib/binfmts"); err == nil {
 		m.AddVolume("/var/lib/binfmts")
 	}
 
-	return
+	return m, nil
 }
 
 func InMachine() (ret bool) {
@@ -86,23 +133,10 @@ func InMachine() (ret bool) {
 	return
 }
 
+// Check whether the auto backend is supported
 func Supported() bool {
-	_, err := os.Stat("/dev/kvm")
+	_, err := newBackend("auto", nil)
 	return err == nil
-}
-
-func charsToString(in []int8) string {
-	s := make([]byte, len(in))
-
-	i := 0
-	for ; i < len(in); i++ {
-		if in[i] == 0 {
-			break
-		}
-		s[i] = byte(in[i])
-	}
-
-	return string(s[0:i])
 }
 
 const initScript = `#!/bin/busybox sh
@@ -110,21 +144,21 @@ const initScript = `#!/bin/busybox sh
 busybox mount -t proc proc /proc
 busybox mount -t sysfs none /sys
 
-busybox modprobe virtio_pci
-busybox modprobe 9pnet_virtio
-busybox modprobe 9p
+# probe additional modules
+{{ range $m := .Backend.InitModules }}
+busybox modprobe {{ $m }}
+{{ end }}
 
-busybox mount -v -t 9p -o trans=virtio,version=9p2000.L,cache=loose,msize=262144 usr /usr
-if ! busybox test -L /bin ; then
-	busybox mount -v -t 9p -o trans=virtio,version=9p2000.L,cache=loose,msize=262144 sbin /sbin
-	busybox mount -v -t 9p -o trans=virtio,version=9p2000.L,cache=loose,msize=262144 bin /bin
-	busybox mount -v -t 9p -o trans=virtio,version=9p2000.L,cache=loose,msize=262144 lib /lib
-fi
+# mount static volumes
+{{ range $point := StaticVolumes .Machine }}
+{{ MountVolume $.Backend $point }}
+{{ end }}
+
 exec /lib/systemd/systemd
 `
-const networkd = `
+const networkdTemplate = `
 [Match]
-Name=e*
+Name=%[1]s
 
 [Network]
 DHCP=ipv4
@@ -145,11 +179,13 @@ if [ $? != 0 ]; then
   exit
 fi
 
-echo Running '%[1]s'
-%[1]s
+echo Running '%[2]s' using '%[1]s' backend
+%[2]s
 echo $? > /run/fakemachine/result
 `
 
+// The line 'Environment=%[2]s' is used for environment variables optionally
+// configured using Machine.SetEnviron()
 const serviceTemplate = `
 [Unit]
 Description=fakemachine runner
@@ -158,25 +194,73 @@ Before=shutdown.target
 Requires=basic.target
 Wants=systemd-resolved.service binfmt-support.service systemd-networkd.service
 After=basic.target systemd-resolved.service binfmt-support.service systemd-networkd.service
+OnFailure=poweroff.target
 
 [Service]
-Environment=HOME=/root IN_FAKE_MACHINE=yes
+Environment=HOME=/root IN_FAKE_MACHINE=yes %[2]s
 WorkingDirectory=-/scratch
 ExecStart=/wrapper
 ExecStopPost=/bin/sync
 ExecStopPost=/bin/systemctl poweroff -ff
-OnFailure=poweroff.target
 Type=idle
+TTYPath=%[1]s
 StandardInput=tty-force
 StandardOutput=inherit
 StandardError=inherit
 KillMode=process
 IgnoreSIGPIPE=no
 SendSIGHUP=yes
+LimitNOFILE=4096
 `
 
+// helper function to generate a mount command for a given mountpoint
+func tmplMountVolume(b backend, m mountPoint) string {
+	fsType, options := b.MountParameters(m)
+
+	mntCommand := []string{"busybox", "mount", "-v"}
+	mntCommand = append(mntCommand, "-t", fsType)
+	if len(options) > 0 {
+		mntCommand = append(mntCommand, "-o", strings.Join(options, ","))
+	}
+	mntCommand = append(mntCommand, m.label)
+	mntCommand = append(mntCommand, m.machineDirectory)
+	return strings.Join(mntCommand, " ")
+}
+
+// helper function to return the static volumes from a machine, since the mounts variable is unexported
+// include the extra static mounts from the backend
+func tmplStaticVolumes(m Machine) []mountPoint {
+	mounts := []mountPoint{}
+	for _, mount := range append(m.mounts, m.backend.InitStaticVolumes()...) {
+		if mount.static {
+			mounts = append(mounts, mount)
+		}
+	}
+	return mounts
+}
+
+func executeInitScriptTemplate(m *Machine, b backend) []byte {
+	helperFuncs := template.FuncMap{
+		"MountVolume": tmplMountVolume,
+		"StaticVolumes": tmplStaticVolumes,
+	}
+
+	type templateVars struct {
+		Machine *Machine
+		Backend backend
+	}
+	tmplVariables := templateVars{m, b}
+
+	tmpl := template.Must(template.New("init").Funcs(helperFuncs).Parse(initScript))
+	out := &bytes.Buffer{}
+	if err := tmpl.Execute(out, tmplVariables); err != nil {
+		panic(err)
+	}
+	return out.Bytes()
+}
+
 func (m *Machine) addStaticVolume(directory, label string) {
-	m.mounts = append(m.mounts, mountPoint{directory, directory, label})
+	m.mounts = append(m.mounts, mountPoint{directory, directory, label, true})
 }
 
 // AddVolumeAt mounts hostDirectory from the host at machineDirectory in the
@@ -189,7 +273,7 @@ func (m *Machine) AddVolumeAt(hostDirectory, machineDirectory string) {
 			return
 		}
 	}
-	m.mounts = append(m.mounts, mountPoint{hostDirectory, machineDirectory, label})
+	m.mounts = append(m.mounts, mountPoint{hostDirectory, machineDirectory, label, false})
 	m.count = m.count + 1
 }
 
@@ -241,7 +325,7 @@ func (m *Machine) CreateImageWithLabel(path string, size int64, label string) (s
 	i.Close()
 	m.images = append(m.images, image{path, label})
 
-	return fmt.Sprintf("/dev/disk/by-id/virtio-%s", label), nil
+	return fmt.Sprintf("/dev/disk/by-fakemachine-label/%s", label), nil
 }
 
 // CreateImage does the same as CreateImageWithLabel but lets the library pick
@@ -264,6 +348,11 @@ func (m *Machine) SetNumCPUs(numcpus int) {
 	m.numcpus = numcpus
 }
 
+// SetShowBoot sets whether to show boot/console messages from the fakemachine.
+func (m *Machine) SetShowBoot(showBoot bool) {
+	m.showBoot = showBoot
+}
+
 // SetScratch sets the size and location of on-disk scratch space to allocate
 // (sparsely) for /scratch. If not set /scratch will be backed by memory. If
 // Path is "" then the working directory is used as a default storage location
@@ -276,7 +365,7 @@ func (m *Machine) SetScratch(scratchsize int64, path string) {
 	}
 }
 
-func (m *Machine) generateFstab(w *writerhelper.WriterHelper) {
+func (m Machine) generateFstab(w *writerhelper.WriterHelper, backend backend) {
 	fstab := []string{"# Generated fstab file by fakemachine"}
 
 	if m.scratchfile == "" {
@@ -287,72 +376,74 @@ func (m *Machine) generateFstab(w *writerhelper.WriterHelper) {
 	}
 
 	for _, point := range m.mounts {
+		fstype, options := backend.MountParameters(point)
 		fstab = append(fstab,
-			fmt.Sprintf("%s %s 9p trans=virtio,version=9p2000.L,cache=loose,msize=262144 0 0",
-				point.label, point.machineDirectory))
+			fmt.Sprintf("%s %s %s %s 0 0",
+				point.label, point.machineDirectory, fstype, strings.Join(options, ",")))
 	}
 	fstab = append(fstab, "")
 
 	w.WriteFile("/etc/fstab", strings.Join(fstab, "\n"), 0755)
 }
 
-func (m *Machine) kernelRelease() (string, error) {
-	/* First try the kernel the current system is running, but if there are no
-	 * modules for that try the latest from /lib/modules. The former works best
-	 * for systems direclty running fakemachine, the latter makes sense in docker
-	 * environments */
-	var u syscall.Utsname
-	syscall.Uname(&u)
-	release := charsToString(u.Release[:])
-
-	if _, err := os.Stat(path.Join("/lib/modules", release)); err == nil {
-		return release, nil
-	}
-
-	files, err := ioutil.ReadDir("/lib/modules")
-	if err != nil {
-		return "", err
-	}
-
-	if len(files) == 0 {
-		return "", fmt.Errorf("No kernel found")
-	}
-
-	return (files[len(files)-1]).Name(), nil
+func (m *Machine) SetEnviron(environ []string) {
+	m.Environ = environ
 }
 
-func (m *Machine) writerKernelModules(w *writerhelper.WriterHelper) error {
-	kernelRelease, err := m.kernelRelease()
+func (m *Machine) writerKernelModules(w *writerhelper.WriterHelper, moddir string, modules []string) error {
+	if len(modules) == 0 {
+		return nil
+	}
+
+	modules = append(modules,
+			"modules.order",
+			"modules.builtin",
+			"modules.dep",
+			"modules.dep.bin",
+			"modules.alias",
+			"modules.alias.bin",
+			"modules.softdep",
+			"modules.symbols",
+			"modules.symbols.bin",
+			"modules.builtin.bin",
+			"modules.devname")
+
+	// build a list of built-in modules so that we don’t attempt to copy them
+	var builtinModules = make(map[string]bool)
+
+	f, err := os.Open(path.Join(moddir, "modules.builtin"))
 	if err != nil {
 		return err
 	}
+	defer f.Close()
 
-	modules := []string{
-		"kernel/drivers/virtio/virtio.ko",
-		"kernel/drivers/virtio/virtio_pci.ko",
-		"kernel/net/9p/9pnet.ko",
-		"kernel/drivers/virtio/virtio_ring.ko",
-		"kernel/fs/9p/9p.ko",
-		"kernel/net/9p/9pnet_virtio.ko",
-		"kernel/fs/fscache/fscache.ko",
-		"modules.order",
-		"modules.builtin",
-		"modules.dep",
-		"modules.dep.bin",
-		"modules.alias",
-		"modules.alias.bin",
-		"modules.softdep",
-		"modules.symbols",
-		"modules.symbols.bin",
-		"modules.builtin.bin",
-		"modules.devname"}
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		module := scanner.Text()
+		builtinModules[module] = true
+	}
+
+	if err := scanner.Err(); err != nil {
+		return err
+	}
 
 	for _, v := range modules {
-		usrpath := "/lib/modules"
-		if mergedUsrSystem() {
-			usrpath = "/usr/lib/modules"
+		if builtinModules[v] {
+			continue
 		}
-		if err := w.CopyFile(path.Join(usrpath, kernelRelease, v)); err != nil {
+
+		modpath := path.Join(moddir, v)
+
+		if strings.HasSuffix(modpath, ".ko") {
+			if _, err := os.Stat(modpath); err != nil {
+				modpath += ".xz"
+			}
+			if _, err := os.Stat(modpath); err != nil {
+				return err
+			}
+		}
+
+		if err := w.CopyFile(modpath); err != nil {
 			return err
 		}
 	}
@@ -393,6 +484,8 @@ func (m *Machine) cleanup() {
 func (m *Machine) startup(command string, extracontent [][2]string) (int, error) {
 	defer m.cleanup()
 
+	os.Setenv("PATH", os.Getenv("PATH") + ":/sbin:/usr/sbin")
+
 	tmpdir, err := ioutil.TempDir("", "fakemachine-")
 	if err != nil {
 		return -1, err
@@ -405,9 +498,16 @@ func (m *Machine) startup(command string, extracontent [][2]string) (int, error)
 		return -1, err
 	}
 
-	InitrdPath := path.Join(tmpdir, "initramfs.cpio")
-	f, err := os.OpenFile(InitrdPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0755)
+	m.initrdpath = path.Join(tmpdir, "initramfs.cpio")
+	f, err := os.OpenFile(m.initrdpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0755)
 
+	if err != nil {
+		return -1, err
+	}
+
+	backend := m.backend
+
+	_, kernelModuleDir, err := backend.KernelPath()
 	if err != nil {
 		return -1, err
 	}
@@ -442,6 +542,13 @@ func (m *Machine) startup(command string, extracontent [][2]string) (int, error)
 	if mergedUsrSystem() {
 		prefix = "/usr"
 	}
+
+	// search for busybox; in some distros it's located under /sbin
+	busybox, err := exec.LookPath("busybox")
+	if err != nil {
+		return -1, err
+	}
+	w.CopyFileTo(busybox, prefix + "/bin/busybox")
 
 	qemu := ""
 
@@ -504,6 +611,14 @@ func (m *Machine) startup(command string, extracontent [][2]string) (int, error)
 
 	w.CopyFile(prefix + "/bin/busybox")
 
+	/* C libraries */
+	libraryDir, err := realDir("/lib64/ld-linux-x86-64.so.2")
+	if err != nil {
+		return -1, err
+	}
+	w.CopyFile(libraryDir + "/libc.so.6")
+	w.CopyFile(libraryDir + "/libresolv.so.2")
+
 	w.WriteCharDevice("/dev/console", 5, 1, 0700)
 
 	// Linker configuration
@@ -518,16 +633,21 @@ func (m *Machine) startup(command string, extracontent [][2]string) (int, error)
 	w.CopyFile("/etc/group")
 	w.CopyFile("/etc/nsswitch.conf")
 
-	w.WriteFile("/etc/systemd/network/ethernet.network", networkd, 0444)
+	// udev rules
+	udevRules := strings.Join(backend.UdevRules(), "\n") + "\n"
+	w.WriteFile("/etc/udev/rules.d/61-fakemachine.rules", udevRules, 0444)
+
+	w.WriteFile("/etc/systemd/network/ethernet.network",
+		fmt.Sprintf(networkdTemplate, backend.NetworkdMatch()), 0444)
 	w.WriteSymlink(
 		"/lib/systemd/resolv.conf",
 		"/etc/resolv.conf",
 		0755)
 
-	m.writerKernelModules(w)
+	m.writerKernelModules(w, kernelModuleDir, backend.InitrdModules())
 
 	w.WriteFile("etc/systemd/system/fakemachine.service",
-		serviceTemplate, 0755)
+		fmt.Sprintf(serviceTemplate, backend.JobOutputTTY(), strings.Join(m.Environ, " ")), 0644)
 
 	w.WriteSymlink(
 		"/lib/systemd/system/serial-getty@ttyS0.service",
@@ -535,11 +655,11 @@ func (m *Machine) startup(command string, extracontent [][2]string) (int, error)
 		0755)
 
 	w.WriteFile("/wrapper",
-		fmt.Sprintf(commandWrapper, command), 0755)
+		fmt.Sprintf(commandWrapper, backend.Name(), command), 0755)
 
-	w.WriteFile("/init", initScript, 0755)
+	w.WriteFileRaw("/init", executeInitScriptTemplate(m, backend), 0755)
 
-	m.generateFstab(w)
+	m.generateFstab(w, backend)
 
 	for _, v := range extracontent {
 		w.CopyFileTo(v[0], v[1])
@@ -548,48 +668,9 @@ func (m *Machine) startup(command string, extracontent [][2]string) (int, error)
 	w.Close()
 	f.Close()
 
-	kernelRelease, err := m.kernelRelease()
-	if err != nil {
-		return -1, err
-	}
-	memory := fmt.Sprintf("%d", m.memory)
-	numcpus := fmt.Sprintf("%d", m.numcpus)
-	qemuargs := []string{qemu,
-		"-cpu", "host",
-		"-smp", numcpus,
-		"-m", memory,
-		"-enable-kvm",
-		"-kernel", "/boot/vmlinuz-" + kernelRelease,
-		"-initrd", InitrdPath,
-		"-nographic",
-		"-no-reboot"}
-	kernelargs := []string{"console=ttyS0", "quiet", "panic=-1",
-		"systemd.unit=fakemachine.service"}
-
-	for _, point := range m.mounts {
-		qemuargs = append(qemuargs, "-virtfs",
-			fmt.Sprintf("local,mount_tag=%s,path=%s,security_model=none",
-				point.label, point.hostDirectory))
-	}
-
-	for i, img := range m.images {
-		qemuargs = append(qemuargs, "-drive",
-			fmt.Sprintf("file=%s,if=none,format=raw,cache=unsafe,id=drive-virtio-disk%d", img.path, i))
-		qemuargs = append(qemuargs, "-device",
-			fmt.Sprintf("virtio-blk-pci,drive=drive-virtio-disk%d,id=virtio-disk%d,serial=%s",
-				i, i, img.label))
-	}
-
-	qemuargs = append(qemuargs, "-append", strings.Join(kernelargs, " "))
-
-	pa := os.ProcAttr{
-		Files: []*os.File{os.Stdin, os.Stdout, os.Stderr},
-	}
-
-	if p, err := os.StartProcess("/usr/bin/" + qemu, qemuargs, &pa); err != nil {
-		return -1, err
-	} else {
-		p.Wait()
+	success, err := backend.Start()
+	if !success || err != nil {
+		return -1, fmt.Errorf("error starting %s backend: %v", backend.Name(), err)
 	}
 
 	result, err := os.Open(path.Join(tmpdir, "result"))
